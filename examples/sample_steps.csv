@@ -1,0 +1,3 @@
+step_no,start_utc_seconds,end_utc_seconds,polarity,note
+1,10,20,positive,charge CC
+2,30,40,negative,discharge CC

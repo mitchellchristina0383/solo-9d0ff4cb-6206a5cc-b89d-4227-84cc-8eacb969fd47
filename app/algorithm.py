@@ -62,8 +62,89 @@ class Cycle:
     ended_at: int
 
 
+@dataclass
+class MeasuredSegment:
+    """A zero-closed, gap-free run of one current polarity.
+
+    ``started_at`` is the timestamp of the first non-zero sample of the run
+    (a sign flip or a gap starts a new run; the data start also counts), and
+    ``ended_at`` is the timestamp of the zero sample that closes it.
+    ``capacity_ah`` is the same left-value integral used by the cycle report.
+    """
+
+    segment_no: int
+    polarity: int  # +1 charge, -1 discharge
+    started_at: int
+    ended_at: int
+    capacity_ah: float
+
+
 def _is_zero(current: float) -> bool:
     return abs(current) <= EPS
+
+
+def extract_measured_segments(samples: Sequence[Sample]) -> List[MeasuredSegment]:
+    """Extract measured current segments usable for step-table comparison.
+
+    A segment is a maximal run of consecutive samples with the same non-zero
+    sign that
+
+      * is closed by a zero-current sample, and
+      * contains no gap > 60 s between adjacent samples.
+
+    Unclosed runs at the end of the data are discarded, and a gap > 60 s
+    starts a fresh run (the long interval itself contributes no charge).  A
+    direct sign change without a zero boundary ends the previous run without
+    closing it and starts a new run at the changing sample.  The integral
+    over each interval uses the left value, exactly as
+    :func:`detect_cycles` does.
+    """
+    segments: List[MeasuredSegment] = []
+    run: MeasuredSegment | None = None
+    prev_ts: int | None = None
+    prev_i: float | None = None
+
+    for ts, current in samples:
+        if prev_ts is not None:
+            dt = ts - prev_ts
+            if dt > GAP_SECONDS:
+                # The long interval is excluded and does not close the run;
+                # the sample at ts may begin a fresh run below.
+                run = None
+            elif run is not None:
+                # prev_i has the run's polarity because a sign change would
+                # have replaced the run on the previous iteration.
+                run.capacity_ah += abs(prev_i) * dt / 3600.0
+
+        if _is_zero(current):
+            if run is not None:
+                run.ended_at = ts
+                segments.append(run)
+                run = None
+        else:
+            sign = 1 if current > 0 else -1
+            if run is None:
+                run = MeasuredSegment(
+                    segment_no=len(segments) + 1,
+                    polarity=sign,
+                    started_at=ts,
+                    ended_at=ts,
+                    capacity_ah=0.0,
+                )
+            elif run.polarity != sign:
+                # Direct sign change without a zero boundary: the previous
+                # run never closed, so it is not a measured segment.
+                run = MeasuredSegment(
+                    segment_no=len(segments) + 1,
+                    polarity=sign,
+                    started_at=ts,
+                    ended_at=ts,
+                    capacity_ah=0.0,
+                )
+
+        prev_ts, prev_i = ts, current
+
+    return segments
 
 
 def tokenize(samples: Sequence[Sample]) -> List[Token]:

@@ -2,7 +2,9 @@
 
 Runs against an already-started uvicorn (default http://127.0.0.1:8000).
 Covers: late-point rewrite/renumbering, gap truncation, idempotency and
-conflict rejection, and concurrent uploads/queries with snapshot consistency.
+conflict rejection, concurrent uploads/queries with snapshot consistency,
+step-table whole-table replacement, unmatched steps, tied optima candidates
+and the combined state endpoint.
 """
 
 import concurrent.futures
@@ -19,6 +21,16 @@ def upload(client, cell, rows, header="timestamp,current"):
     return client.post(
         f"{BASE}/cells/{cell}/samples",
         files={"file": ("batch.csv", text, "text/csv")},
+    )
+
+
+def upload_steps(client, cell, rows):
+    text = "step_no,start_utc_seconds,end_utc_seconds,polarity\n" + "".join(
+        f"{no},{start},{end},{pol}\n" for no, start, end, pol in rows
+    )
+    return client.post(
+        f"{BASE}/cells/{cell}/steps",
+        files={"file": ("steps.csv", text, "text/csv")},
     )
 
 
@@ -114,6 +126,90 @@ def main():
 
         cells = c.get(f"{BASE}/cells").json()
         check(any(x["cell_id"] == cell for x in cells), "cell list endpoint")
+
+        # --- 5. step table + diagnostics --------------------------------
+        cell = "LIVE-STEPS"
+        upload(c, cell, [(0, 0), (10, 2), (20, 0), (50, 1), (60, 0)])
+        # planned +,+,+ but the middle step was never measured
+        r = upload_steps(
+            c,
+            cell,
+            [(1, 10, 20, "positive"), (2, 30, 40, "positive"),
+             (3, 50, 60, "positive")],
+        )
+        check(r.status_code == 200, "step table replaced as a whole")
+        d = c.get(f"{BASE}/cells/{cell}/diagnostics").json()
+        check(
+            [(p["step_no"], p["segment_no"]) for p in d["matched"]]
+            == [(1, 1), (3, 2)],
+            "missed step skipped, later steps realign",
+        )
+        check(
+            [s["step_no"] for s in d["unmatched_steps"]] == [2],
+            "missed step reported as unmatched",
+        )
+        check(d["ambiguous"] is False, "unique optimum is not ambiguous")
+        check(
+            abs(d["matched"][0]["capacity_ah"] - 2 * 10 / 3600) < 1e-12,
+            "paired measured segment carries integrated capacity",
+        )
+        check(d["consistent"] is True, "diagnosis digest matches samples")
+
+        # overlapping table rejected, old table kept
+        r = upload_steps(
+            c,
+            cell,
+            [(1, 10, 20, "positive"), (2, 19, 30, "negative")],
+        )
+        check(r.status_code == 400, "overlapping step table rejected")
+        d2 = c.get(f"{BASE}/cells/{cell}/diagnostics").json()
+        check(d2["step_version"] == 1, "old step table still in force")
+
+        # --- 6. tied optimum -> candidates, no arbitrary choice ---------
+        cell = "LIVE-TIE"
+        upload(c, cell, [(90, 0), (100, 1), (104, 0), (105, 1), (109, 0)])
+        upload_steps(c, cell, [(1, 100, 110, "positive")])
+        d = c.get(f"{BASE}/cells/{cell}/diagnostics").json()
+        check(d["max_pairs"] == 1, "tie: one pair is optimal")
+        check(d["ambiguous"] is True, "tie flagged as ambiguous")
+        check(d["matched"] == [], "tied step not reported as definite")
+        check(d["candidate_count_exact"] == 2, "both tied optima counted")
+        check(len(d["candidates"]) == 2, "both tied optima returned")
+        check(
+            d["ambiguous_steps"][0]["candidate_segment_nos"] == [1, 2],
+            "competing measured segments listed",
+        )
+
+        # --- 7. state endpoint versions agree ---------------------------
+        state = c.get(f"{BASE}/cells/{cell}/state").json()
+        check(
+            state["diagnostics"]["step_version"]
+            == state["step_table"]["step_version"],
+            "state: step table matches diagnosis",
+        )
+        check(
+            state["report"]["version"] == state["diagnostics"]["report_version"],
+            "state: report version matches diagnosis",
+        )
+        check(state["diagnostics"]["consistent"], "state: snapshot consistent")
+
+        # --- 8. late point rewrites diagnosis ---------------------------
+        cell = "LIVE-LATE-DIAG"
+        upload(c, cell, [(0, 0), (10, 2), (20, 0)])
+        upload_steps(c, cell, [(1, 10, 20, "positive")])
+        before = c.get(f"{BASE}/cells/{cell}/diagnostics").json()
+        check(before["max_pairs"] == 1, "initial diagnosis has one pair")
+        upload(c, cell, [(15, -2)])
+        after = c.get(f"{BASE}/cells/{cell}/diagnostics").json()
+        check(after["max_pairs"] == 0, "late point invalidates the pairing")
+        check(
+            [s["step_no"] for s in after["unmatched_steps"]] == [1],
+            "step now reported unmatched",
+        )
+        check(
+            after["diagnostics_version"] > before["diagnostics_version"],
+            "diagnosis version advanced",
+        )
 
     print("\nALL LIVE CHECKS PASSED")
 
